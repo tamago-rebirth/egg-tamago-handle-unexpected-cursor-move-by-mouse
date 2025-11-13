@@ -1,0 +1,181 @@
+minibuffer にいる時に可笑しい順番で fire することがある。当然か。
+
+
+;; === Three-Generation State Flow for Mouse Events ===
+;;
+;; Concept:
+;;   prev   = state two commands/events ago
+;;   last   = state one command/event ago
+;;   now    = current state
+;;
+;; Purpose:
+;;   Use these three generations to detect abrupt cursor movement
+;;   and decide whether to invoke `egg-exit-conversion` or `its-exit-mode`.
+;;   This avoids hooking every mouse event individually.
+;;
+;; Timeline:
+;;
+;;   Event Sequence:   Command / Mouse Event
+;;   ---------------------------------------------------------------
+;;   prev             | prev-pos, prev-state, prev-cmd, prev-key
+;;   last             | last-pos, last-state, last-cmd, last-key
+;;   now              | now-pos, now-state, now-cmd, now-key
+;;
+;; Example 1: Normal character insertion
+;;   prev   = fence at 100, cmd=its-self-insert-char
+;;   last   = fence at 101, cmd=its-self-insert-char
+;;   now    = fence at 102, cmd=its-self-insert-char
+;;   -> No abrupt movement, continue conversion
+;;
+;; Example 2: Mouse drag / abrupt cursor jump
+;;   prev   = fence at 150, cmd=its-self-insert-char
+;;   last   = fence at 150, cmd=mouse-drag-region
+;;   now    = conversion at 200, cmd=mouse-drag-region
+;;   -> Abrupt movement detected
+;;      Pre-command checker decides: invoke `egg-exit-conversion`
+;;
+;; Example 3: Minibuffer interaction
+;;   prev   = fence at 50, cmd=its-self-insert-char
+;;   last   = fence at 51, cmd=its-self-insert-char
+;;   now    = fence at 51, cmd=mouse-1 (minibuffer)
+;;   -> First mouse event may be unreliable
+;;   -> The immediately following event (prev+last+now) can decide exit
+;;
+;; Flowchart:
+;;
+;;    [prev state] --> [last state] --> [now state]
+;;         |               |                |
+;;         |               |                v
+;;         |               |         pre-command checker
+;;         |               |                |
+;;         v               v                |
+;;   record state     record state         |
+;;         |               |                |
+;;         +---------------+----------------+
+;;                         |
+;;                 evaluate abrupt move?
+;;                         |
+;;                 ---------------------
+;;                 |                   |
+;;               Yes                   No
+;;                 |                   |
+;;      invoke egg-exit-conversion      continue
+;;                 |
+;;          record exit command as now
+;;
+;; Notes:
+;; - Always record state (pos, conversion/fence, cmd, key) even in minibuffer
+;;   even if logging is disabled.
+;; - Do NOT invoke exit commands directly from mouse wrapper to avoid
+;;   recursion or dynamic scope issues.
+;; - This three-generation logic smooths over mechanical switch bounce
+;;   and irregular pre/post command hook ordering.
+
+
+;; === Core Problem Summary ===
+;;
+;; When the cursor moves abruptly (mouse, command, minibuffer transition),
+;; we must detect whether the Japanese input conversion state (ITS)
+;; has been broken and then exit conversion cleanly.
+;;
+;; But:
+;;
+;; 1. The minibuffer is a fragile place — many commands that call
+;;    (interactive ...) cannot be safely invoked from inside minibuffer hooks
+;;    or during mouse events.
+;;
+;; 2. Mouse handlers run in command context; they might trigger minibuffer
+;;    input or other interactive states.  Directly calling `egg-exit-conversion`
+;;    (which itself manipulates minibuffer or echo area) from within a mouse
+;;    handler can indeed be unsafe.
+;;
+;; 3. Pre/post hooks (especially those attached to `post-command-hook` and
+;;    `pre-command-hook`) run after commands finish or before they start.
+;;    These are *safe* points to check and invoke something interactive like
+;;    `egg-exit-conversion`, since they happen in command loop context —
+;;    not nested inside minibuffer’s read loop.
+;;
+;; That’s why the earlier idea of a secondary trace hook (3-gen) was actually
+;; elegant and conceptually right:
+;;   → Mouse handler records the event and updates the *state*
+;;   → Pre/post checker observes the updated state and performs the safe exit.
+;;
+;; === Simplified Control Flow ===
+;;
+;;  ┌──────────────┐
+;;  │ Mouse event  │───▶  egg-mouse-1-wrapper
+;;  │ (unsafe zone)│
+;;  └──────┬───────┘
+;;         │
+;;         ▼
+;;    update global tracking vars
+;;    (egg--mouse-triggered, egg--mouse-target-pos, etc.)
+;;         │
+;;         ▼
+;;  ┌──────────────┐
+;;  │ post-command │───▶  egg-trace-position-recorder-3gen
+;;  │ (safe zone)  │
+;;  └──────────────┘
+;;         │
+;;         ▼
+;;    if egg--mouse-triggered = t
+;;       and movement large or outside region
+;;       then (egg-exit-conversion)
+;;    reset egg--mouse-triggered flag
+;;
+;; === Key Principle ===
+;;
+;; Mouse handler *records intent* (that a movement occurred),
+;; Hook *decides action* (safe invocation).
+
+
+Minibuffer でのevent handling は tricky
+interactive function をよんでしまったりすると minibuffer から入力読も
+うとしたりする。
+
+ ┌──────────────┐
+ │ Mouse event           │───▶  egg-mouse-1-wrapper
+ │ (unsafe zone)         │
+ └──────┬───────┘
+        │
+        ▼
+   update global tracking vars
+   (egg--mouse-triggered, egg--mouse-target-pos, etc.)
+        │
+        ▼
+ ┌──────────────┐
+ │ post-command          │───▶  egg-trace-position-recorder-3gen
+ │ (safe zone)           │
+ └──────────────┘
+        │
+        ▼
+   if egg--mouse-triggered = t
+      and movement large or outside region
+      then (egg-exit-conversion)
+   reset egg--mouse-triggered flag
+
+------------
+Exactly — the three-generation monitor is designed to detect single-event anomalies, like a weird conversion state caused by one unexpected mouse event or command. It works very well for one-off glitches.
+
+But what your log shows is a burst of mouse events in rapid succession, essentially acting as multiple “state-changing” events within the time it takes to process one. Even though each individual event is checked against the three-generation snapshot:
+
+prev
+
+last
+
+now
+
+…these snapshots can get overwritten before the exit logic has fully applied. That is, egg-exit-conversion is triggered, but then the next mouse event arrives so quickly that the pre-checker takes a snapshot using the old conversion state and triggers again. The first exit state never “sticks” in egg--now-pos-state.
+
+Think of it like this:
+
+Event Timeline: 
+   t0: now-state = conversion
+   t1: mouse event 1 -> triggers egg-exit-conversion
+       -> but next mouse event arrives before now-state update fully applied
+   t2: mouse event 2 -> pre-checker sees still conversion
+       -> triggers another exit (or ignores, depending on guard)
+   ...
+
+Turns out Drag eventS are just like that.
+
