@@ -114,7 +114,7 @@ Suppress logging when current buffer is *ITS-DEBUG* itself or minibuffer is acti
   ;; - The last condition ensures we can look at the debug buffer and
   ;;   scroll through it without getting new log messages added while
   ;;   we do this.
-  
+
   (when (and  its-debug-enabled
              (not  (minibufferp))
              (not (string= (buffer-name (current-buffer)) its-debug-log-buffer)))
@@ -158,13 +158,13 @@ Suppress logging when current buffer is *ITS-DEBUG* itself or minibuffer is acti
 ;;;
 ;;; Why three? To make a long story short, there are very complex
 ;;; event sequences when mouse is involved, especially when egg/tamago
-;;; input is used minibuffer .  I could only figure out what was
+;;; input is used minibuffer.  I could only figure out what was
 ;;; happening only after recording two generations of old data and
 ;;; compare it to the next state.
 ;;;
 ;;; Case in point: One of my mouse seems to broken and generates mouse
 ;;; DRAG event when I simply click the left button to move a cursor to
-;;; new position, for no apparent reason.  example.  OS mouse driver
+;;; new position, for no apparent reason.  OS mouse driver
 ;;; and even the Emacs's mouse handler seems to cope with such barrage
 ;;; of strange mouse events that arrive in short successon, but some
 ;;; strange mouse events do seep to user applicaton.
@@ -173,20 +173,29 @@ Suppress logging when current buffer is *ITS-DEBUG* itself or minibuffer is acti
 ;;; unexpected arrival order of events created by a faulty mouse
 ;;; and/or driver.
 
+;;; ========================================================================
+;;; Enhanced state tracking with cached mouse event detection
+;;; ========================================================================
+
+;;; --- Internal state tracking (with mouse event caching) ---
+ 
 (defvar egg--prev-pos-pos nil)   ;; second-last POS
 (defvar egg--prev-pos-state nil) ;; second-last state symbol
 (defvar egg--prev-pos-cmd nil)   ;; second-last cmd
 (defvar egg--prev-pos-key nil)   ;; second-last key desc
+(defvar egg--prev-pos-mouse nil) ;; NEW: second-last mouse event flag
 
 (defvar egg--last-pos-pos nil)   ;; last POS
 (defvar egg--last-pos-state nil) ;; last state symbol
 (defvar egg--last-pos-cmd nil)   ;; last cmd
 (defvar egg--last-pos-key nil)   ;; last key desc
+(defvar egg--last-pos-mouse nil) ;; NEW: last mouse event flag
 
 (defvar egg--now-pos-pos nil)    ;; now POS (transient)
 (defvar egg--now-pos-state nil)  ;; now state (transient)
 (defvar egg--now-pos-cmd nil)    ;; now cmd (transient)
 (defvar egg--now-pos-key nil)    ;; now key (transient)
+(defvar egg--now-pos-mouse nil)  ;; NEW: now mouse event flag (transient)
 
 (defvar egg--mouse-original-binding nil)
 
@@ -217,6 +226,7 @@ Possible values:
 ;;  EGG-TRACE utilities
 ;;----------------------------------------------------------------
 
+
 ;; --- [20251108-004-A]  New helper  ----------------------------------------
 ;; Now we handle wheel-related events to some extent.
 (defun egg--mouse-related-command-p (cmd)
@@ -244,52 +254,294 @@ byte-compiled lambda in Emacs 30+."
    )
   )
 
+;;; Better/Complete version
+
+;;; ========================================================================
+;;; Mouse/Wheel Event Detection - Point-Changing Events Only
+;;; Optimized for dynamic scope and performance
+;;; ========================================================================
+
+;;; Before the regular expression was enhanced,
+;;; mouse-trag-region (command name) was not caught.
+;;; When you press <down-mouse-1>, Emacs translates it to the command
+;;; mouse-drag-region, so:
+;;; this-command = mouse-drag-region (sumbol)
+;;; (this-command-key-vector) = [down-mouse-1]
+;;;
+;;; Also, we need to add OUR OWN wrapper name like
+;;; egg-mouse-1-wrapper
+;;;
+(defconst egg--point-changing-mouse-regexp
+  (concat
+   "\\`"
+   "\\(?:"
+   ;; 修飾キーの組み合わせ（オプション）
+   ;; Group 1: Event names (what user presses)
+   "\\(?:[CMS]-\\|C-[MS]-\\|M-S-\\|C-M-S-\\)?"
+   ;; イベントタイプ
+   "\\(?:"
+   ;; マウスクリック系（イベント名）
+   "\\(?:double-\\|triple-\\)?\\(?:down-\\|drag-\\)?mouse-[123]"
+   ;; ホイール系（イベント名）
+   "\\|wheel-\\(?:up\\|down\\|left\\|right\\)"
+   ;; 古い形式のホイール
+   "\\|\\(?:m\\)?wheel-scroll"
+   "\\|mouse-wheel"
+   "\\)"
+   "\\|"
+   ;; === FIXED: Add actual command names ===
+   ;; Group 2: Command names (what Emacs executes)
+   "mouse-"
+   "\\(?:"
+   ;; ポイント変更系のコマンド
+   "set-point"
+   "\\|drag-region"    ;; <- これが足りなかった！
+   "\\|drag-secondary"
+   "\\|save-then-kill"
+   "\\|secondary-save-then-kill"
+   "\\|yank-primary"
+   "\\|yank-secondary"
+   "\\|yank-at-click"
+   "\\|set-secondary"
+   "\\|start-secondary"
+   "\\|set-mark"
+   "\\|drag-and-drop-region"
+   "\\|drag-track"
+   "\\|choose-completion"
+   "\\)"
+   "\\|"
+   ;; Group 3: EGG/TAMAGO custom mouse wrappers
+   "egg-mouse-.*-wrapper" ;; Matches any egg-mouse-*-wrapper
+   "\\)"
+   "\\'"
+   )
+  "Single optimized regexp matching mouse/wheel events and commands that change point.
+Covers both event names (down-mouse-1) and command names (mouse-drag-region).
+Covers:
+- Basic clicks: mouse-1, mouse-2, mouse-3
+- Down events: down-mouse-1, down-mouse-2, down-mouse-3
+- Drag events: drag-mouse-1, drag-mouse-2, drag-mouse-3
+- Double/Triple: double-mouse-1, triple-mouse-1, etc.
+- Modifiers: C-, M-, S-, C-M-, C-S-, M-S-, C-M-S-
+- Wheels: wheel-up, wheel-down, wheel-left, wheel-right, mwheel-scroll
+- Commands: mouse-set-point, mouse-drag-region, etc.")
+
+(defconst egg--non-point-changing-mouse-regexp
+  (concat
+   "\\`"
+   "\\(?:"
+   "mode-line"
+   "\\|header-line"
+   "\\|tab-\\(?:line\\|bar\\)"
+   "\\|tool-bar"
+   "\\|vertical-line"
+   "\\|\\(?:vertical\\|horizontal\\)-scroll-bar"
+   "\\|\\(?:left\\|right\\)-fringe"
+   "\\|mouse-movement"
+   "\\)")
+  "Single regexp matching mouse events that do NOT change point.
+These are special area events or movement-only events.")
+
+(defun egg--point-changing-mouse-event-p (cmd)
+  "Return non-nil if CMD is a mouse/wheel event that can change point position.
+
+This function is designed to replace `egg--mouse-related-command-p` with
+a more precise detection that focuses only on events relevant to
+Egg/Tamago input mode interruption.
+
+Uses optimized single-regexp matching for performance.
+Compatible with dynamic scope (lexical-binding: nil).
+
+Arguments:
+  CMD - Command symbol, byte-code function, or nil
+
+Returns:
+  Non-nil if CMD can change cursor position
+  Nil otherwise
+
+Examples:
+  (egg--point-changing-mouse-event-p 'mouse-set-point)     => t
+  (egg--point-changing-mouse-event-p 'down-mouse-1)        => t
+  (egg--point-changing-mouse-event-p 'C-M-double-mouse-1)  => t
+  (egg--point-changing-mouse-event-p 'wheel-down)          => t
+  (egg--point-changing-mouse-event-p 'mode-line)           => nil
+  (egg--point-changing-mouse-event-p 'mouse-movement)      => nil"
+  (when cmd
+    (let ((name (cond
+                 ((symbolp cmd) 
+                  (symbol-name cmd))
+                 ((byte-code-function-p cmd) 
+                  (prin1-to-string cmd))
+                 (t ""))))
+      ;; まず除外パターンをチェック（高速リターン）
+     (if (string-match-p egg--non-point-changing-mouse-regexp name)
+          nil
+       ;; 次にポイント変更パターンにマッチするかチェック
+        (if (string-match-p egg--point-changing-mouse-regexp name)
+            t
+          nil)))))
+
+
+;;; --- テスト関数（動的スコープ対応） ---
+(defun egg--test-point-changing-detection ()
+  "Test function for point-changing mouse event detection.
+Run this interactively to verify the detection logic.
+Compatible with dynamic scope."
+  (interactive)
+  (let ((test-cases
+         '((mouse-1 . t)
+           (mouse-2 . t)
+           (mouse-3 . t)
+           (down-mouse-1 . t)
+           (down-mouse-2 . t)
+           (drag-mouse-1 . t)
+           (double-mouse-1 . t)
+           (triple-mouse-1 . t)
+           (double-down-mouse-1 . t)
+           (triple-drag-mouse-1 . t)
+           (C-mouse-1 . t)
+           (M-mouse-2 . t)
+           (S-mouse-3 . t)
+           (C-M-mouse-1 . t)
+           (C-S-mouse-2 . t)
+           (M-S-mouse-3 . t)
+           (C-M-S-mouse-1 . t)
+           (C-double-mouse-1 . t)
+           (M-triple-mouse-1 . t)
+           (C-M-S-drag-mouse-1 . t)
+           (wheel-down . t)
+           (wheel-up . t)
+           (wheel-left . t)
+           (wheel-right . t)
+           (mwheel-scroll . t)
+           (wheel-scroll . t)
+           (mouse-wheel . t)
+           (C-wheel-down . t)
+           (M-wheel-up . t)
+           (C-M-S-wheel-down . t)
+           (mouse-set-point . t)
+           (mouse-drag-region . t)
+           (mouse-save-then-kill . t)
+           (mouse-yank-primary . t)
+           (mode-line . nil)
+           (header-line . nil)
+           (tab-line . nil)
+           (tab-bar . nil)
+           (tool-bar . nil)
+           (vertical-line . nil)
+           (vertical-scroll-bar . nil)
+           (horizontal-scroll-bar . nil)
+           (left-fringe . nil)
+           (right-fringe . nil)
+           (mouse-movement . nil)
+           (self-insert-command . nil)
+           (forward-char . nil)
+           (nil . nil)))
+        (pass-count 0)
+        (fail-count 0))
+    (with-output-to-temp-buffer "*Egg Point-Changing Test*"
+      (princ "=== Egg Point-Changing Mouse Event Detection Test ===\n")
+      (princ (format "Using single regexp optimization\n\n"))
+      (let ((case-item nil)
+            (cmd nil)
+            (expected nil)
+            (result nil)
+            (status nil))
+        (while test-cases
+          (setq case-item (car test-cases))
+          (setq test-cases (cdr test-cases))
+          (setq cmd (car case-item))
+          (setq expected (cdr case-item))
+          (setq result (egg--point-changing-mouse-event-p cmd))
+          (setq status (if (eq (not (not result)) expected) "PASS" "FAIL"))
+          (if (string= status "PASS")
+              (setq pass-count (1+ pass-count))
+            (setq fail-count (1+ fail-count)))
+          (princ (format "[%s] %-30s expected: %-5s got: %-5s\n"
+                        status cmd expected (not (not result))))))
+      (princ (format "\nTotal: %d tests, %d passed, %d failed\n"
+                    (+ pass-count fail-count) pass-count fail-count)))))
+
+;;; --- 性能比較テスト（オプション） ---
+(defun egg--benchmark-detection ()
+  "Benchmark the optimized detection function.
+Compares single-regexp vs multiple-regexp approach."
+  (interactive)
+  (let ((test-symbols '(mouse-1 down-mouse-1 C-M-S-double-mouse-1
+                        wheel-down mode-line mouse-movement
+                        self-insert-command forward-char
+                        egg-mouse-1-wrapper ))
+        (iterations 10000)
+        (start-time nil)
+        (elapsed nil))
+    (garbage-collect)
+    (setq start-time (float-time))
+    (dotimes (i iterations)
+      (dolist (sym test-symbols)
+        (egg--point-changing-mouse-event-p sym)))
+    (setq elapsed (- (float-time) start-time))
+    (message "Benchmark: %d iterations x %d symbols = %.3f seconds (%.1f μs per call)"
+             iterations (length test-symbols) elapsed
+             (* (/ elapsed (* iterations (length test-symbols))) 1000000))))
+;;; OLD: Benchmark: 10000 iterations x 8 symbols = 0.084 seconds (1.0 μs per call)
+;;; NEW: Benchmark: 10000 iterations x 8 symbols = 0.086 seconds (1.1 μs per call)
+;;; NEW: Benchmark: 10000 iterations x 9 symbols = 0.092 seconds (1.0 μs per call)
+;;; AMD Ryzen 5700x, Debian GNU/Linux inside vmware workstation running uder windows 10
+
 ;;; ========================================================================
 ;;; REFACTORING [2025-11-14]: Common logic extraction
 ;;; ========================================================================
 ;;; The following functions extract duplicate logic that was present in both
 ;;; egg-trace-position-pre-checker and egg-trace-position-recorder.
 ;;; This adheres to DRY principle while preserving all original behavior.
+;;; REFACTORING: Common logic with cached mouse detection
 ;;; ========================================================================
 
-(defun egg--save-state-snapshot (pos state cmd key)
+(defun egg--save-state-snapshot (pos state cmd key is-mouse)
   "Save current state snapshot to transient now-variables.
+IS-MOUSE should be the result of egg--point-changing-mouse-event-p.
 This is a helper function to avoid code duplication in PRE/POST hooks."
   (setq egg--now-pos-pos pos
         egg--now-pos-state state
         egg--now-pos-cmd cmd
-        egg--now-pos-key key))
+        egg--now-pos-key key
+        egg--now-pos-mouse is-mouse))
 
-(defun egg--shift-state-history (pos state cmd key)
+(defun egg--shift-state-history (pos state cmd key is-mouse)
   "Shift state history: last->prev, current->last.
+IS-MOUSE should be the cached mouse event detection result.
 This is a helper function to avoid code duplication in POST hook."
   (setq egg--prev-pos-pos egg--last-pos-pos
         egg--prev-pos-state egg--last-pos-state
         egg--prev-pos-cmd egg--last-pos-cmd
-        egg--prev-pos-key egg--last-pos-key)
+        egg--prev-pos-key egg--last-pos-key
+        egg--prev-pos-mouse egg--last-pos-mouse)
   (setq egg--last-pos-pos pos
         egg--last-pos-state state
         egg--last-pos-cmd cmd
-        egg--last-pos-key key))
+        egg--last-pos-key key
+        egg--last-pos-mouse is-mouse))
 
-(defun egg--detect-abrupt-mouse-movement (current-pos current-state current-cmd current-key hook-name)
+(defun egg--detect-abrupt-mouse-movement (current-pos current-state current-is-mouse current-key hook-name)
   "Detect abrupt mouse movement and trigger egg-exit-conversion if needed.
 
 This function encapsulates the common detection logic used in both
 PRE and POST command hooks.
+This function now uses CACHED mouse event detection results instead of
+calling egg--point-changing-mouse-event-p multiple times.
 
 Arguments:
-  CURRENT-POS    - Current cursor position
-  CURRENT-STATE  - Current input state symbol
-  CURRENT-CMD    - Current command being executed
-  CURRENT-KEY    - Key description string
-  HOOK-NAME      - String identifier for logging (e.g., \"PRE\" or \"POST\")
+  CURRENT-POS      - Current cursor position
+  CURRENT-STATE    - Current input state symbol
+  CURRENT-IS-MOUSE - Cached result: is current command a mouse event?
+  CURRENT-KEY      - Key description string
+  HOOK-NAME        - String identifier for logging (e.g., \"PRE\" or \"POST\")
 
 Detection algorithm:
   Condition 1: Three consecutive states in conversion/fence mode
   Condition 2: Position changed between prev->last but stayed same last->now
-  Condition 3: Last command was mouse-related
-  Condition 4: Current command is mouse-related
+  Condition 3: Last command was mouse-related (CACHED)
+  Condition 4: Current command is mouse-related (CACHED)
 
 When all four conditions are met, invokes egg-exit-conversion at prev position."
   (when (and egg--prev-pos-pos egg--last-pos-pos)
@@ -298,24 +550,23 @@ When all four conditions are met, invokes egg-exit-conversion at prev position."
                        (member current-state '(conversion fence))))
            (cond2 (and (/= egg--prev-pos-pos egg--last-pos-pos)
                        (= egg--last-pos-pos current-pos)))
-           (cond3 (and egg--last-pos-cmd
-                       (egg--mouse-related-command-p egg--last-pos-cmd)))
-           (cond4 (and current-cmd
-                       (egg--mouse-related-command-p current-cmd))))
-      
+           ;; OPTIMIZED: Use cached mouse detection results
+           (cond3 egg--last-pos-mouse)
+           (cond4 current-is-mouse))
+
       ;; Log individual condition results for diagnostics
       (its-debug-log "[EGG-%s] Condition check: cond1=%s cond2=%s cond3=%s cond4=%s"
                      hook-name cond1 cond2 cond3 cond4)
-      
+
       ;; Conditions 1 & 2 true but 3 or 4 false -> warn
       (when (and cond1 cond2 (not (and cond3 cond4)))
         (its-debug-log
          "[EGG-WARN-%s] Conditions 1 & 2 satisfied, but mouse keys not detected (last-key=%s, now-key=%s); not invoking egg-exit-conversion"
          hook-name egg--last-pos-key current-key))
-      
+
       ;; All 4 conditions satisfied -> trigger exit
       (when (and cond1 cond2 cond3 cond4)
-        (its-debug-log "[EGG-%s] Abrupt mouse movement detected in conversion/fence. Invoking egg-exit-conversion"
+        (its-debug-log "[EGG-%s] Abrupt mouse movement detected in conversion/fence. Invoking egg/Tamago exit"
                        hook-name)
         (condition-case inner-err
             (save-excursion
@@ -325,34 +576,40 @@ When all four conditions are met, invokes egg-exit-conversion at prev position."
                   (egg-exit-conversion))
                 (when (and (eq current-state 'fence) (fboundp 'its-exit-mode))
                   (its-exit-mode))
-                ;; === Post-exit variable reset (per your request) ===
+                ;; === Post-exit variable reset ===
                 (setq egg--last-pos-state nil
                       egg--last-pos-cmd 'egg-exit-conversion
                       egg--last-pos-key '\n
+                      egg--last-pos-mouse nil  ;; Reset cached flag
                       egg--now-pos-pos current-pos
                       egg--now-pos-state current-state)
                 (set-marker saved-marker nil)))
           (error
-           (its-debug-log "[EGG-%s] ERROR during egg-exit-conversion: %s" hook-name inner-err)))))))
+           (its-debug-log "[EGG-%s] ERROR during egg/Tamago exit: %s" hook-name inner-err)))))))
 
-(defun egg--handle-mouse-down-in-conversion (current-cmd current-state hook-name)
+;;
+;; In perfect world, the following function probabaly triggers first
+;; always before egg--detect-abrupt-mouse-movement.
+;;
+(defun egg--handle-mouse-down-in-conversion (current-is-mouse current-state hook-name)
   "Handle down-mouse-1 event when last state is conversion/fence.
 
 This function encapsulates the second detection mechanism used in both
 PRE and POST command hooks.
-
+This function now uses CACHED mouse event detection result.
 Arguments:
-  CURRENT-CMD    - Current command being executed
-  CURRENT-STATE  - Current input state symbol
-  HOOK-NAME      - String identifier for logging (e.g., \"PRE\" or \"POST\")
+  CURRENT-IS-MOUSE - Cached result: is current command a mouse event?
+  CURRENT-STATE    - Current input state symbol
+  HOOK-NAME        - String identifier for logging (e.g., \"PRE\" or \"POST\")
 
 Detection algorithm:
-  - Current command is mouse-related
+  - Current command is mouse-related (CACHED)
   - Last state was conversion/fence
   - Position changed between prev and last
 
 When conditions are met, invokes exit functions at last position."
-  (when (and (egg--mouse-related-command-p current-cmd)
+  ;; OPTIMIZED: Use cached mouse detection result
+  (when (and current-is-mouse
              (member egg--last-pos-state '(conversion fence))
              (/= egg--prev-pos-pos egg--last-pos-pos))
     ;; Trigger exit at the last known position before mouse click/drag
@@ -368,7 +625,8 @@ When conditions are met, invokes exit functions at last position."
             ;; Reset last-pos after forced exit
             (setq egg--last-pos-state nil
                   egg--last-pos-cmd 'egg-exit-conversion
-                  egg--last-pos-key '\n)
+                  egg--last-pos-key '\n
+                  egg--last-pos-mouse nil)  ;; Reset cached flag
             (set-marker saved-marker nil)))
       (error
        (its-debug-log "[EGG-%s] ERROR during forced exit for down-mouse-1: %s" hook-name inner-err)))))
@@ -379,25 +637,28 @@ When conditions are met, invokes exit functions at last position."
 
 ;;; --- Pre-command hook: detect unexpected movement and optionally exit conversion ---
 (defun egg-trace-position-pre-checker ()
-  "Pre-command hook: detect unexpected movement and exit conversion if needed."
+  "Pre-command hook: detect unexpected movement and exit conversion if needed.
+OPTIMIZED: Calls egg--point-changing-mouse-event-p only once per event."
   (condition-case top-err
-      (let ((now-pos (point))
-            (now-state (egg-current-input-state))
-            (cmd this-command)
-            (key (key-description (this-command-keys-vector))))
+      (let* ((now-pos (point))
+             (now-state (egg-current-input-state))
+             (cmd this-command)
+             (key (key-description (this-command-keys-vector)))
+             ;; OPTIMIZATION: Call mouse detection only once
+             (is-mouse (egg--point-changing-mouse-event-p cmd)))
         ;; --- Trace logging ---
         (its-debug-log
-         "[EGG-PRE] Trace snapshot:\n  prev-pos=%s prev-state=%s prev-cmd=%s prev-key=%s\n  last-pos=%s last-state=%s last-cmd=%s last-key=%s\n  now-pos=%s now-state=%s now-cmd=%s now-key=%s"
-         egg--prev-pos-pos egg--prev-pos-state egg--prev-pos-cmd egg--prev-pos-key
-         egg--last-pos-pos egg--last-pos-state egg--last-pos-cmd egg--last-pos-key
-         now-pos now-state cmd key)
+         "[EGG-PRE] Trace snapshot:\n  prev-pos=%s prev-state=%s prev-cmd=%s prev-key=%s prev-mouse=%s\n  last-pos=%s last-state=%s last-cmd=%s last-key=%s last-mouse=%s\n  now-pos=%s now-state=%s now-cmd=%s now-key=%s now-mouse=%s"
+         egg--prev-pos-pos egg--prev-pos-state egg--prev-pos-cmd egg--prev-pos-key egg--prev-pos-mouse
+         egg--last-pos-pos egg--last-pos-state egg--last-pos-cmd egg--last-pos-key egg--last-pos-mouse
+         now-pos now-state cmd key is-mouse)
         
-        ;; Save current state to transient variables
-        (egg--save-state-snapshot now-pos now-state cmd key)
+        ;; Save current state to transient variables (with cached mouse flag)
+        (egg--save-state-snapshot now-pos now-state cmd key is-mouse)
         
-        ;; === REFACTORED: Use common detection functions ===
-        (egg--detect-abrupt-mouse-movement now-pos now-state cmd key "PRE")
-        (egg--handle-mouse-down-in-conversion cmd now-state "PRE"))
+        ;; === Use cached mouse detection results ===
+        (egg--detect-abrupt-mouse-movement now-pos now-state is-mouse key "PRE")
+        (egg--handle-mouse-down-in-conversion is-mouse now-state "PRE"))
     (error
      (its-debug-log "[EGG-PRE] ERROR: %s" top-err))))
 
@@ -406,25 +667,28 @@ When conditions are met, invokes exit functions at last position."
 ;;; We repeat the invocation of exit from tamago here, too.
 ;;; A buggy mouse made it easier to handle the situation here.
 (defun egg-trace-position-recorder ()
-  "Post-command hook: record and log cursor state."
+  "Post-command hook: record and log cursor state.
+OPTIMIZED: Calls egg--point-changing-mouse-event-p only once per event."
   (condition-case top-err
-      (let ((pos (point))
-            (state (egg-current-input-state))
-            (cmd this-command)
-            (key (key-description (this-command-keys-vector))))
+      (let* ((pos (point))
+             (state (egg-current-input-state))
+             (cmd this-command)
+             (key (key-description (this-command-keys-vector)))
+             ;; OPTIMIZATION: Call mouse detection only once
+             (is-mouse (egg--point-changing-mouse-event-p cmd)))
         ;; --- Logging in the same verbose trace format as PRE
         (its-debug-log
-         "[EGG-POST] Trace snapshot:\n  prev-pos=%s prev-state=%s prev-cmd=%s prev-key=%s\n  last-pos=%s last-state=%s last-cmd=%s last-key=%s\n  now-pos=%s now-state=%s now-cmd=%s now-key=%s"
-         egg--prev-pos-pos egg--prev-pos-state egg--prev-pos-cmd egg--prev-pos-key
-         egg--last-pos-pos egg--last-pos-state egg--last-pos-cmd egg--last-pos-key
-         pos state cmd key)
-        
-        ;; === REFACTORED: Use common detection functions ===
-        (egg--detect-abrupt-mouse-movement pos state cmd key "POST")
-        (egg--handle-mouse-down-in-conversion cmd state "POST")
-        
-        ;; --- Shift last->prev, now->last updates (explicit variables) ---
-        (egg--shift-state-history pos state cmd key))
+         "[EGG-POST] Trace snapshot:\n  prev-pos=%s prev-state=%s prev-cmd=%s prev-key=%s prev-mouse=%s\n  last-pos=%s last-state=%s last-cmd=%s last-key=%s last-mouse=%s\n  now-pos=%s now-state=%s now-cmd=%s now-key=%s now-mouse=%s"
+         egg--prev-pos-pos egg--prev-pos-state egg--prev-pos-cmd egg--prev-pos-key egg--prev-pos-mouse
+         egg--last-pos-pos egg--last-pos-state egg--last-pos-cmd egg--last-pos-key egg--last-pos-mouse
+         pos state cmd key is-mouse)
+
+        ;; === Use cached mouse detection results ===
+        (egg--detect-abrupt-mouse-movement pos state is-mouse key "POST")
+        (egg--handle-mouse-down-in-conversion is-mouse state "POST")
+
+        ;; --- Shift last->prev, now->last updates (with cached mouse flag) ---
+        (egg--shift-state-history pos state cmd key is-mouse))
     (error
      (its-debug-log "[EGG-POST] ERROR: %s" top-err)
      (with-temp-buffer
@@ -628,4 +892,3 @@ if available, and makes the buffer visible."
 (provide 'egg-its-mouse-tracker)
 ;;; End of canonical file [2025-11-02T12:00 JST / rev. FINAL]
 ;;; Refactored: 2025-11-14 - Duplicate logic extraction
->
