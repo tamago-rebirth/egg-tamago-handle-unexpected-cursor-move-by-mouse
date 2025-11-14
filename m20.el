@@ -93,6 +93,10 @@
 (defvar its-debug-start-timestamp nil
   "Timestamp marking the start of current ITS debug session.")
 
+;;; IMPROVEMENT: Make magic numbers configurable
+(defvar egg-dump-buffer-max-chars 100
+  "Maximum characters to dump in buffer snapshots.")
+
 ;;; --- Logging core ---
 (defun its-current-timestamp ()
   "Return timestamp string (for markers and headers)."
@@ -102,10 +106,16 @@
   "Log formatted message to *ITS-DEBUG* buffer, timestamped and numbered.
 Logging is done only when its-debug-enabled is non-nil.
 Suppress logging when current buffer is *ITS-DEBUG* itself or minibuffer is active."
-  ;; Avoid logging when user is in minibuffer or in the ITS debug buffer itself.
-  (unless (and (not its-debug-enabled)
-               (or (minibufferp)
-              (string= (buffer-name (current-buffer)) its-debug-log-buffer)))
+  ;; FIXED: Previously had inverted logic. Now correctly checks:
+  ;; - its-debug-enabled must be non-nil
+  ;; - current buffer must NOT be minibuffer
+  ;; - current buffer must NOT be the debug buffer itself
+  ;; - The last condition ensures we can look at the debug buffer
+  ;;   and scroll through it without getting new lines added while we do this.
+  
+  (when (and  its-debug-enabled
+             (not  (minibufferp))
+             (not (string= (buffer-name (current-buffer)) its-debug-log-buffer)))
     (setq its-debug-running-counter (1+ its-debug-running-counter))
     (let* ((timestamp (its-current-timestamp))
            (msg (apply #'format fmt args))
@@ -133,31 +143,29 @@ Suppress logging when current buffer is *ITS-DEBUG* itself or minibuffer is acti
 (defun egg--dump-buffer-snapshot (&optional label)
   "Dump buffer content (truncated) with text properties."
   (let ((label (or label "snapshot"))
-        (end-pos (min (+ (point-min) 100) (point-max))))
-    (with-current-buffer (current-buffer)
-      (let ((i (point-min)))
-        (while (< i end-pos)
-          (let ((ch (char-after i))
-                (props (text-properties-at i)))
-            (its-debug-log "[EGG-DUMP] %s POS=%d Char='%c' Props=%s"
-                           label i (if ch ch ?\0) props))
-          (setq i (1+ i)))))))
+        (end-pos (min (+ (point-min) egg-dump-buffer-max-chars) (point-max)))
+        (i (point-min)))
+    (while (< i end-pos)
+      (let ((ch (char-after i))
+            (props (text-properties-at i)))
+        (its-debug-log "[EGG-DUMP] %s POS=%d Char='%c' Props=%s"
+                       label i (if ch ch ?\0) props))
+      (setq i (1+ i)))))
 
 ;;; --- Internal state tracking (explicit variables, no plists) ---
 ;;;
 ;;; Why three? To make a long story short, there are very complex
 ;;; event sequences when mouse is involved, especially when egg/tamago
-;;; input is used in minibuffer .  I could only figure out what was
+;;; input is used minibuffer .  I could only figure out what was
 ;;; happening only after recording two generations of old data and
 ;;; compare it to the next state.
 ;;;
-;;; Case in point: One of my mouse seems to be broken and generates
-;;; mouse DRAG event when I simply click the left button to move a
-;;; cursor to new position, for no apparent reason.  example.  OS
-;;; mouse driver and even the Emacs's mouse handler seems to cope with
-;;; such barrage of strange mouse events that arrive in short
-;;; successon, but some strange mouse events do seep to user
-;;; applicaton.
+;;; Case in point: One of my mouse seems to broken and generates mouse
+;;; DRAG event when I simply click the left button to move a cursor to
+;;; new position, for no apparent reason.  example.  OS mouse driver
+;;; and even the Emacs's mouse handler seems to cope with such barrage
+;;; of strange mouse events that arrive in short successon, but some
+;;; strange mouse events do seep to user applicaton.
 ;;;
 ;;; BEWARE: So the logically correct handling here may not work with
 ;;; unexpected arrival order of events created by a faulty mouse
@@ -215,6 +223,8 @@ Preserves dynamic scope and never signals type errors.
 Used in pre/post trace diagnostics where `this-command' may be a
 byte-compiled lambda in Emacs 30+."
   (cond
+   ;; Case 0 — nil/null command (IMPROVEMENT: Added defensive check)
+   ((null cmd) nil)
    ;; Case 1 — ordinary symbol command
    ((symbolp cmd)
     (or (string-match-p "mouse" (symbol-name cmd))
