@@ -2,6 +2,7 @@
 ;; ===============================================================
 ;; [EGG / TAMAGO Integrated Input Tracker with ITS Report]
 ;; Canonical base: 2025-11-02T12:00 JST / rev. FINAL
+;; Refactored: 2025-11-14 - Duplicate logic extraction
 ;; ===============================================================
 ;; Preserves full historical logic with additive ITS-REPORT subsystem
 ;; ===============================================================
@@ -80,7 +81,7 @@
 ;;; 2. Checking for mouse or wheel related events/commands are
 ;;;    done by very loose string match. We may want to make exact comparison, but
 ;;;    in order to do that, we have to enumarate all the mouse or wheel events.
-;;;    This is something I have not done. Currect code "works" for my situation.
+;;;    This is something I have not done. Current code "works" for my situation.
 
 ;;; --- Global variables ---
 (defvar its-debug-enabled nil
@@ -110,8 +111,9 @@ Suppress logging when current buffer is *ITS-DEBUG* itself or minibuffer is acti
   ;; - its-debug-enabled must be non-nil
   ;; - current buffer must NOT be minibuffer
   ;; - current buffer must NOT be the debug buffer itself
-  ;; - The last condition ensures we can look at the debug buffer
-  ;;   and scroll through it without getting new lines added while we do this.
+  ;; - The last condition ensures we can look at the debug buffer and
+  ;;   scroll through it without getting new log messages added while
+  ;;   we do this.
   
   (when (and  its-debug-enabled
              (not  (minibufferp))
@@ -242,6 +244,139 @@ byte-compiled lambda in Emacs 30+."
    )
   )
 
+;;; ========================================================================
+;;; REFACTORING [2025-11-14]: Common logic extraction
+;;; ========================================================================
+;;; The following functions extract duplicate logic that was present in both
+;;; egg-trace-position-pre-checker and egg-trace-position-recorder.
+;;; This adheres to DRY principle while preserving all original behavior.
+;;; ========================================================================
+
+(defun egg--save-state-snapshot (pos state cmd key)
+  "Save current state snapshot to transient now-variables.
+This is a helper function to avoid code duplication in PRE/POST hooks."
+  (setq egg--now-pos-pos pos
+        egg--now-pos-state state
+        egg--now-pos-cmd cmd
+        egg--now-pos-key key))
+
+(defun egg--shift-state-history (pos state cmd key)
+  "Shift state history: last->prev, current->last.
+This is a helper function to avoid code duplication in POST hook."
+  (setq egg--prev-pos-pos egg--last-pos-pos
+        egg--prev-pos-state egg--last-pos-state
+        egg--prev-pos-cmd egg--last-pos-cmd
+        egg--prev-pos-key egg--last-pos-key)
+  (setq egg--last-pos-pos pos
+        egg--last-pos-state state
+        egg--last-pos-cmd cmd
+        egg--last-pos-key key))
+
+(defun egg--detect-abrupt-mouse-movement (current-pos current-state current-cmd current-key hook-name)
+  "Detect abrupt mouse movement and trigger egg-exit-conversion if needed.
+
+This function encapsulates the common detection logic used in both
+PRE and POST command hooks.
+
+Arguments:
+  CURRENT-POS    - Current cursor position
+  CURRENT-STATE  - Current input state symbol
+  CURRENT-CMD    - Current command being executed
+  CURRENT-KEY    - Key description string
+  HOOK-NAME      - String identifier for logging (e.g., \"PRE\" or \"POST\")
+
+Detection algorithm:
+  Condition 1: Three consecutive states in conversion/fence mode
+  Condition 2: Position changed between prev->last but stayed same last->now
+  Condition 3: Last command was mouse-related
+  Condition 4: Current command is mouse-related
+
+When all four conditions are met, invokes egg-exit-conversion at prev position."
+  (when (and egg--prev-pos-pos egg--last-pos-pos)
+    (let* ((cond1 (and (member egg--prev-pos-state '(conversion fence))
+                       (member egg--last-pos-state '(conversion fence))
+                       (member current-state '(conversion fence))))
+           (cond2 (and (/= egg--prev-pos-pos egg--last-pos-pos)
+                       (= egg--last-pos-pos current-pos)))
+           (cond3 (and egg--last-pos-cmd
+                       (egg--mouse-related-command-p egg--last-pos-cmd)))
+           (cond4 (and current-cmd
+                       (egg--mouse-related-command-p current-cmd))))
+      
+      ;; Log individual condition results for diagnostics
+      (its-debug-log "[EGG-%s] Condition check: cond1=%s cond2=%s cond3=%s cond4=%s"
+                     hook-name cond1 cond2 cond3 cond4)
+      
+      ;; Conditions 1 & 2 true but 3 or 4 false -> warn
+      (when (and cond1 cond2 (not (and cond3 cond4)))
+        (its-debug-log
+         "[EGG-WARN-%s] Conditions 1 & 2 satisfied, but mouse keys not detected (last-key=%s, now-key=%s); not invoking egg-exit-conversion"
+         hook-name egg--last-pos-key current-key))
+      
+      ;; All 4 conditions satisfied -> trigger exit
+      (when (and cond1 cond2 cond3 cond4)
+        (its-debug-log "[EGG-%s] Abrupt mouse movement detected in conversion/fence. Invoking egg-exit-conversion"
+                       hook-name)
+        (condition-case inner-err
+            (save-excursion
+              (let ((saved-marker (point-marker)))
+                (goto-char egg--prev-pos-pos)
+                (when (and (eq current-state 'conversion) (fboundp 'egg-exit-conversion))
+                  (egg-exit-conversion))
+                (when (and (eq current-state 'fence) (fboundp 'its-exit-mode))
+                  (its-exit-mode))
+                ;; === Post-exit variable reset (per your request) ===
+                (setq egg--last-pos-state nil
+                      egg--last-pos-cmd 'egg-exit-conversion
+                      egg--last-pos-key '\n
+                      egg--now-pos-pos current-pos
+                      egg--now-pos-state current-state)
+                (set-marker saved-marker nil)))
+          (error
+           (its-debug-log "[EGG-%s] ERROR during egg-exit-conversion: %s" hook-name inner-err)))))))
+
+(defun egg--handle-mouse-down-in-conversion (current-cmd current-state hook-name)
+  "Handle down-mouse-1 event when last state is conversion/fence.
+
+This function encapsulates the second detection mechanism used in both
+PRE and POST command hooks.
+
+Arguments:
+  CURRENT-CMD    - Current command being executed
+  CURRENT-STATE  - Current input state symbol
+  HOOK-NAME      - String identifier for logging (e.g., \"PRE\" or \"POST\")
+
+Detection algorithm:
+  - Current command is mouse-related
+  - Last state was conversion/fence
+  - Position changed between prev and last
+
+When conditions are met, invokes exit functions at last position."
+  (when (and (egg--mouse-related-command-p current-cmd)
+             (member egg--last-pos-state '(conversion fence))
+             (/= egg--prev-pos-pos egg--last-pos-pos))
+    ;; Trigger exit at the last known position before mouse click/drag
+    (its-debug-log "[EGG-%s] Mouse down detected; invoking exit at last state/position" hook-name)
+    (condition-case inner-err
+        (save-excursion
+          (let ((saved-marker (point-marker)))
+            (goto-char egg--last-pos-pos)
+            (when (and (eq egg--last-pos-state 'conversion) (fboundp 'egg-exit-conversion))
+              (egg-exit-conversion))
+            (when (and (eq egg--last-pos-state 'fence) (fboundp 'its-exit-mode))
+              (its-exit-mode))
+            ;; Reset last-pos after forced exit
+            (setq egg--last-pos-state nil
+                  egg--last-pos-cmd 'egg-exit-conversion
+                  egg--last-pos-key '\n)
+            (set-marker saved-marker nil)))
+      (error
+       (its-debug-log "[EGG-%s] ERROR during forced exit for down-mouse-1: %s" hook-name inner-err)))))
+
+;;; ========================================================================
+;;; END OF REFACTORING SECTION
+;;; ========================================================================
+
 ;;; --- Pre-command hook: detect unexpected movement and optionally exit conversion ---
 (defun egg-trace-position-pre-checker ()
   "Pre-command hook: detect unexpected movement and exit conversion if needed."
@@ -256,71 +391,13 @@ byte-compiled lambda in Emacs 30+."
          egg--prev-pos-pos egg--prev-pos-state egg--prev-pos-cmd egg--prev-pos-key
          egg--last-pos-pos egg--last-pos-state egg--last-pos-cmd egg--last-pos-key
          now-pos now-state cmd key)
-        ;; Update transient now variables (visible to outer logic if needed)
-        (setq egg--now-pos-pos now-pos
-              egg--now-pos-state now-state
-              egg--now-pos-cmd cmd
-              egg--now-pos-key key)
-        ;; === Detect abrupt mouse movement in conversion/fence ===
-        (when (and egg--prev-pos-pos egg--last-pos-pos)
-          (let* ((cond1 (and (member egg--prev-pos-state '(conversion fence))
-                             (member egg--last-pos-state '(conversion fence))
-                             (member now-state '(conversion fence))))
-                 (cond2 (and (/= egg--prev-pos-pos egg--last-pos-pos)
-                             (= egg--last-pos-pos now-pos)))
-                 (cond3 (and egg--last-pos-cmd
-                             (egg--mouse-related-command-p egg--last-pos-cmd)))
-                 (cond4 (and cmd
-                             (egg--mouse-related-command-p cmd))))
-            ;; Conditions 1 & 2 true but 3 or 4 false -> warn
-            (when (and cond1 cond2 (not (and cond3 cond4)))
-              (its-debug-log
-               "[EGG-WARN] Conditions 1 & 2 satisfied, but mouse keys not detected (last-key=%s, now-key=%s); not invoking egg-exit-conversion"
-               egg--last-pos-key key))
-            ;; All 4 conditions satisfied -> trigger exit
-            (when (and cond1 cond2 cond3 cond4)
-              (its-debug-log "[EGG-PRE] Abrupt mouse movement detected in conversion/fence. Invoking egg-exit-conversion")
-              (condition-case inner-err
-                  (save-excursion
-                    (let ((saved-marker (point-marker)))
-                      (goto-char egg--prev-pos-pos)
-                      (when (and (eq now-state 'conversion) (fboundp 'egg-exit-conversion))
-                        (egg-exit-conversion))
-                      (when (and (eq now-state 'fence) (fboundp 'its-exit-mode))
-                        (its-exit-mode))
-                      ;; === Post-exit variable reset (per your request) ===
-                      (setq egg--last-pos-state nil
-                            egg--last-pos-cmd 'egg-exit-conversion
-                            egg--last-pos-key '\n
-                            egg--now-pos-pos now-pos
-                            egg--now-pos-state now-state)
-                      (set-marker saved-marker nil)))
-                (error
-                 (its-debug-log "[EGG-PRE] ERROR during egg-exit-conversion: %s" inner-err))))))
-        ;; === New mechanism: handle down-mouse-1 when last state is conversion/fence ===
-        ;; This is similar to 3 generation detection above, but the position
-        ;; to go to before invoking tamago exit function is different.
-        ;;           (string-match-p "<down-mouse-1>" (symbol-name cmd))
-        (when (and (egg--mouse-related-command-p cmd)
-                   (member egg--last-pos-state '(conversion fence))
-                   (/= egg--prev-pos-pos egg--last-pos-pos))
-          ;; Trigger exit at the last known position before mouse click/drag
-          (its-debug-log "[EGG-PRE] Mouse down detected; invoking exit at last state/position")
-          (condition-case inner-err
-              (save-excursion
-                (let ((saved-marker (point-marker)))
-                  (goto-char egg--last-pos-pos)
-                  (when (and (eq egg--last-pos-state 'conversion) (fboundp 'egg-exit-conversion))
-                    (egg-exit-conversion))
-                  (when (and (eq egg--last-pos-state 'fence) (fboundp 'its-exit-mode))
-                    (its-exit-mode))
-                  ;; Reset last-pos after forced exit
-                  (setq egg--last-pos-state nil
-                        egg--last-pos-cmd 'egg-exit-conversion
-                        egg--last-pos-key '\n)
-                  (set-marker saved-marker nil)))
-            (error
-             (its-debug-log "[EGG-PRE] ERROR during forced exit for down-mouse-1: %s" inner-err)))))
+        
+        ;; Save current state to transient variables
+        (egg--save-state-snapshot now-pos now-state cmd key)
+        
+        ;; === REFACTORED: Use common detection functions ===
+        (egg--detect-abrupt-mouse-movement now-pos now-state cmd key "PRE")
+        (egg--handle-mouse-down-in-conversion cmd now-state "PRE"))
     (error
      (its-debug-log "[EGG-PRE] ERROR: %s" top-err))))
 
@@ -341,75 +418,13 @@ byte-compiled lambda in Emacs 30+."
          egg--prev-pos-pos egg--prev-pos-state egg--prev-pos-cmd egg--prev-pos-key
          egg--last-pos-pos egg--last-pos-state egg--last-pos-cmd egg--last-pos-key
          pos state cmd key)
-        ;; === Detect abrupt mouse movement in conversion/fence ===
-        (when (and egg--prev-pos-pos egg--last-pos-pos)
-          (let* ((cond1 (and (member egg--prev-pos-state '(conversion fence))
-                             (member egg--last-pos-state '(conversion fence))
-                             (member state '(conversion fence))))
-                 (cond2 (and (/= egg--prev-pos-pos egg--last-pos-pos)
-                             (= egg--last-pos-pos pos)))
-                 (cond3 (and egg--last-pos-cmd
-                             (egg--mouse-related-command-p egg--last-pos-cmd)))
-                 (cond4 (and cmd
-                             (egg--mouse-related-command-p cmd))))
-            ;; Conditions 1 & 2 true but 3 or 4 false -> warn
-            (when (and cond1 cond2 (not (and cond3 cond4)))
-              (its-debug-log
-               "[EGG-WARN] Conditions 1 & 2 satisfied, but mouse keys not detected (last-key=%s, now-key=%s); not invoking egg-exit-conversion"
-               egg--last-pos-key key))
-            ;; All 4 conditions satisfied -> trigger exit
-            (when (and cond1 cond2 cond3 cond4)
-              (its-debug-log "[EGG-POST] Abrupt mouse movement detected in conversion/fence. Invoking egg-exit-conversion")
-              (condition-case inner-err
-                  (save-excursion
-                    (let ((saved-marker (point-marker)))
-                      (goto-char egg--prev-pos-pos)
-                      (when (and (eq state 'conversion) (fboundp 'egg-exit-conversion))
-                        (egg-exit-conversion))
-                      (when (and (eq state 'fence) (fboundp 'its-exit-mode))
-                        (its-exit-mode))
-                      ;; === Post-exit variable reset ===
-                      (setq egg--last-pos-state nil
-                            egg--last-pos-cmd 'egg-exit-conversion
-                            egg--last-pos-key '\n
-                            egg--now-pos-pos pos
-                            egg--now-pos-state state)
-                      (set-marker saved-marker nil)))
-                (error
-                 (its-debug-log "[EGG-POST] ERROR during egg-exit-conversion: %s" inner-err))))))
-        ;; === New mechanism: handle down-mouse-1 when last state is conversion/fence ===
-        ;; This is similar to 3 generation detection above, but the position
-        ;; to go to before invoking tamago exit function is different.
-        ;; (string-match-p "<down-mouse-1>" (symbol-name cmd))
-        (when (and (egg--mouse-related-command-p cmd)
-                   (member egg--last-pos-state '(conversion fence))
-                   (/= egg--prev-pos-pos egg--last-pos-pos))
-          ;; Trigger exit at the last known position before mouse click/drag
-          (its-debug-log "[EGG-POST] Mouse down detected; invoking exit at last state/position")
-          (condition-case inner-err
-              (save-excursion
-                (let ((saved-marker (point-marker)))
-                  (goto-char egg--last-pos-pos)
-                  (when (and (eq egg--last-pos-state 'conversion) (fboundp 'egg-exit-conversion))
-                    (egg-exit-conversion))
-                  (when (and (eq egg--last-pos-state 'fence) (fboundp 'its-exit-mode))
-                    (its-exit-mode))
-                  ;; Reset last-pos after forced exit
-                  (setq egg--last-pos-state nil
-                        egg--last-pos-cmd 'egg-exit-conversion
-                        egg--last-pos-key '\n)
-                  (set-marker saved-marker nil)))
-            (error
-             (its-debug-log "[EGG-POST] ERROR during forced exit for down-mouse-1: %s" inner-err))))
+        
+        ;; === REFACTORED: Use common detection functions ===
+        (egg--detect-abrupt-mouse-movement pos state cmd key "POST")
+        (egg--handle-mouse-down-in-conversion cmd state "POST")
+        
         ;; --- Shift last->prev, now->last updates (explicit variables) ---
-        (setq egg--prev-pos-pos egg--last-pos-pos
-              egg--prev-pos-state egg--last-pos-state
-              egg--prev-pos-cmd egg--last-pos-cmd
-              egg--prev-pos-key egg--last-pos-key)
-        (setq egg--last-pos-pos pos
-              egg--last-pos-state state
-              egg--last-pos-cmd cmd
-              egg--last-pos-key key))
+        (egg--shift-state-history pos state cmd key))
     (error
      (its-debug-log "[EGG-POST] ERROR: %s" top-err)
      (with-temp-buffer
@@ -612,3 +627,5 @@ if available, and makes the buffer visible."
 ;;; ---
 (provide 'egg-its-mouse-tracker)
 ;;; End of canonical file [2025-11-02T12:00 JST / rev. FINAL]
+;;; Refactored: 2025-11-14 - Duplicate logic extraction
+>
