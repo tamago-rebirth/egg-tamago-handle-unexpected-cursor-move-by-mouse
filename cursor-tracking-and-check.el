@@ -23,8 +23,17 @@
 ;;; egg-integration-log
 ;;;
 
-;;; Avoid cyclic loading usually loaded by (require 'egg) , correct?
+;;; testing latest string-as-* replacement
+;;;
+;;; (load-file  "/usr/local/share/emacs/site-lisp/egg/verify-egg-string-as.el")
+;;;
+
+;;;
+;;; CYCLIC LOAD usually loaded by (require 'egg) , correct?
 ;;; (load-file  "/usr/local/share/emacs/site-lisp/egg/leim-list.el")
+
+;;; Do we need this?
+;;; Took out (load-file  "/usr/local/share/emacs/site-lisp/egg/menudiag.el")
 
 ;;; (load "/usr/local/share/emacs/site-lisp/egg/egg-tart")
 (setq default-input-method "japanese-egg-wnn")
@@ -32,8 +41,7 @@
 ;;; (setq egg-default-startup-file "~/.eggrc-tamago") 
 ;;; Modify this to fit your needs. 
 (setq egg-default-startup-file "/usr/local/share/emacs/site-lisp/egg/eggrc")
-
-;;; Again, the following is something we should not need.
+;;; Again, this is something we should not need.
 ;;  I have no idea where I used to define this in the maze of
 ;;; my complex .emacs and files that are called from it.
 ;;; We should not need this, but somehow old work-in-progress
@@ -42,23 +50,22 @@
 ;;;
 
 ;;; set this nil for terse operation
-;;; I am debugging and thus setting it t.
 (setq its-debug-enabled t)
-(load-file  "~/wherever/m20.el")
-(egg-load-monitor-hooks)
+(load-file  "~/emacs-test/m20.el")
+(egg-load-monitor-hooks-extended)
 (message "cursor position monitoring code for egg input loaded: unload by M-x egg-unload-monitor-hooks")
 
 ;;;
-;;; Protect undesirable movement by keys.
 ;;; Force C-p, C-n, etc. to exit ITS fence mode or egg conversion mode
 ;;; before moving the current position.
 ;;;
-(load-file "~/wherever/its-exit-wrappers.el")
+(load-file "~/emacs-test/its-exit-wrappers.el")
+
 
 
 ;; ==============================================================
 ;; Usage:
 ;; Place this code in your .emacs after (require 'egg)
 ;; It will automatically track and clean up Egg conversion regions
-;; when the cursor moves unexpectedly and some.
+;; when the cursor moves unexpectedly.
 ;; ==============================================================
