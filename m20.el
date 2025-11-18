@@ -1166,6 +1166,53 @@ if available, and makes the buffer visible."
 Example: (([mouse-1] . mouse-set-point) ([mouse-2] . mouse-yank-primary))")
 
 ;;; --- 汎用マウスラッパー関数 ---
+;;;
+;;; 再帰呼出を避けるチェック
+;;;
+;;; ## 確認結果
+;;; ### 保存されたオリジナルバインディング（全てEmacsネイティブコマンド）
+;;; 1. `mouse-set-point` ✓
+;;; 2. `mouse-yank-primary` ✓
+;;; 3. `mouse-save-then-kill` ✓
+;;; 4. `mwheel-scroll` ✓
+;;;
+;;; **これらは全て：**
+;;; - Emacsの標準コマンド（シンボル）
+;;; - `egg-` プレフィックスを持たない
+;;; - 正規表現 `"^egg-\\(?:mouse\\|wheel\\)-.*-wrapper$"` に**マッチしない**
+;;; - **再帰の危険性ゼロ**
+;;;
+;;; ### インストールされたラッパー
+;;; 
+;;; 1. `egg-mouse-1-wrapper` → `^egg-mouse-.*-wrapper$` にマッチ ✓
+;;; 2. `egg-mouse-2-wrapper` → `^egg-mouse-.*-wrapper$` にマッチ ✓
+;;; 3. `egg-mouse-3-wrapper` → `^egg-mouse-.*-wrapper$` にマッチ ✓
+;;; 4. `egg-wheel-down-wrapper` → 修正後の `^egg-\\(?:mouse\\|wheel\\)-.*-wrapper$` にマッチ ✓
+;;; 5. `egg-wheel-up-wrapper` → 修正後の `^egg-\\(?:mouse\\|wheel\\)-.*-wrapper$` にマッチ ✓
+;;; ## 動作フロー（例：マウス1クリック）
+;;; ユーザーがクリック
+;;;  ↓
+;;; [mouse-1] イベント発生
+;;;  ↓
+;;; egg-mouse-1-wrapper 実行
+;;;  ↓
+;;; egg-mouse-generic-wrapper([mouse-1]) 呼び出し
+;;;  ↓
+;;; egg--mouse-original-bindings から orig = 'mouse-set-point を取得
+;;;  ↓
+;;; ケース1チェック:
+;;;   - (symbolp 'mouse-set-point) → t
+;;;   - (commandp 'mouse-set-point) → t
+;;;   - (eq 'mouse-set-point 'egg-mouse-generic-wrapper) → nil
+;;;   - (string-match-p "^egg-..." "mouse-set-point") → nil ✓
+;;;  ↓
+;;;(call-interactively 'mouse-set-point) 実行 ✓
+;;;
+;;; **結論：再帰の可能性はない。**
+
+;;; 修正版: *ITS-DEBUG* 専用の特別扱いに変更
+;;; minibuffer と read-only バッファは従来通り処理延期
+
 (defun egg-mouse-generic-wrapper (event key-vector)
   "Generic wrapper for mouse events supporting multiple buttons and wheels.
 
@@ -1174,10 +1221,13 @@ Arguments:
   KEY-VECTOR - The key vector (e.g., [mouse-1], [mouse-2]) to look up original binding
 
 This function:
-1. Logs the event for debugging
-2. Determines if the target buffer is special (minibuffer, read-only, etc.)
+1. Logs the event for debugging (except when in *ITS-DEBUG* buffer)
+2. Determines if the target buffer is special (minibuffer or read-only)
 3. Dispatches to the original command safely, avoiding recursion
 4. Falls back to common mouse commands if no binding exists
+
+FIXED: Only *ITS-DEBUG* buffer suppresses logging now.
+       Mouse operations work normally in other * buffers like *scratch*.
 
 The wrapper respects the original semantics while allowing
 pre-command/post-command hooks to intercept and handle
@@ -1191,13 +1241,19 @@ Egg/Tamago state transitions."
              ;; 連想リストから該当キーのオリジナルバインディングを取得
              (orig (cdr (assoc key-vector egg--mouse-original-bindings))))
 
-        (its-debug-log "[EGG-MOUSE-GENERIC] Wrapper invoked for %s; event=%s"
-                       key-vector event)
+        ;; FIXED: *ITS-DEBUG* 以外のバッファではログを記録
+        ;; ログ抑制は its-debug-log 関数内で既に実装済みだが、
+        ;; ここでも明示的にチェックすることで意図を明確化
+        (unless (and buf (string= (buffer-name buf) its-debug-log-buffer))
+          (its-debug-log "[EGG-MOUSE-GENERIC] Wrapper invoked for %s; event=%s"
+                         key-vector event))
 
-        ;; 特殊バッファでは処理を遅延（元のコードと同じロジック）
+        ;; FIXED: 特殊バッファ判定を変更
+        ;; - minibuffer は従来通り延期
+        ;; - read-only バッファも従来通り延期
+        ;; - *で始まるバッファ名の判定を削除
         (if (or (not buf)
                 (minibufferp buf)
-                (string-prefix-p "*" (buffer-name buf))
                 (with-current-buffer buf buffer-read-only))
             (its-debug-log "[EGG-MOUSE-GENERIC] Click deferred in special buffer: %s"
                            (if buf (buffer-name buf) "<no-buffer>"))
@@ -1205,20 +1261,41 @@ Egg/Tamago state transitions."
           ;; オリジナルコマンドへのディスパッチ
           (cond
            ;; ケース1: シンボルコマンド（再帰を避ける）
+           ;; FIXED: wheel系wrapperも除外するように正規表現を拡張
            ((and (symbolp orig)
                  (commandp orig)
                  (not (eq orig 'egg-mouse-generic-wrapper))
-                 (not (string-match-p "^egg-mouse-.*-wrapper$" (symbol-name orig))))
+                 (not (string-match-p "^egg-\\(?:mouse\\|wheel\\)-.*-wrapper$" (symbol-name orig))))
             (its-debug-log "[EGG-MOUSE-GENERIC] Dispatching symbol command: %s" orig)
             (call-interactively orig))
 
            ;; ケース2: 関数バインディング
+
+           ;; 潜在的問題：orig がバイトコンパイルされた
+           ;; egg-wheel-down-wrapper などの場合eq チェックでは検出でき
+           ;; ない可能性がある
+
+           ;; 実際には egg--mouse-original-bindings に保存されるのは
+           ;; Emacsのネイティブコマンドのはずなので、現状は多分問題な
+           ;; いかも。念のためにリストして確認。バイトコンパイルされた
+           ;; wrapperの可能性は低いが（ないわけではなかった。：例
+           ;; mouse.el で定義された コマンドがあり、それは上記の ケー
+           ;; ス１でチェック。 ）防御的にチェック
+           ;;
            ((and (functionp orig)
-                 (not (eq orig 'egg-mouse-generic-wrapper)))
+                 (not (eq orig 'egg-mouse-generic-wrapper))
+                 ;; 追加の安全チェック: symbol-nameで実体を確認
+                 (or (not (symbolp orig))
+                     (not (string-match-p "^egg-\\(?:mouse\\|wheel\\)-.*-wrapper$" 
+                                          (symbol-name orig)))))
             (its-debug-log "[EGG-MOUSE-GENERIC] Applying function binding")
             (apply orig (list event)))
 
            ;; ケース3: フォールバック（キー別のデフォルト動作）
+           ;; ここで再帰呼出チェックは不要。
+           ;; egg--mouse-fallback-dispatch は直接 mouse-set-point など
+           ;; のEmacsコマンドを呼ぶだけで、自分自身やwrapperを呼び出すパス
+           ;; は存在しない。
            (t
             (its-debug-log "[EGG-MOUSE-GENERIC] Using fallback for %s" key-vector)
             (egg--mouse-fallback-dispatch event key-vector)))))
